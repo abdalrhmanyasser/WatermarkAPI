@@ -81,8 +81,7 @@ def get_config() -> Dict[str, Any]:
 
 
 @app.post("/config")
-def set_config(payload: Dict[str, Any] = Body(None)) -> Dict[str, Any]:
-    payload = payload or {}
+def set_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         validate_config(payload)
     except ValueError as exc:
@@ -93,8 +92,7 @@ def set_config(payload: Dict[str, Any] = Body(None)) -> Dict[str, Any]:
 
 
 @app.post("/encode")
-def encode(payload: Dict[str, Any] = Body(None)) -> Any:
-    payload = payload or {}
+def encode(payload: Dict[str, Any] = {}) -> Any:
     config = merge_request_config(payload)
     success = encode_audio(
         config["input_file"],
@@ -104,14 +102,18 @@ def encode(payload: Dict[str, Any] = Body(None)) -> Any:
     )
     if not success:
         raise HTTPException(status_code=500, detail="Encoding failed")
+
     if payload.get("return_file", False):
-        return FileResponse(config["watermarked_file"], media_type="audio/wav", filename=os.path.basename(config["watermarked_file"]))
-    return {"success": True, "config": config, "file": config["watermarked_file"]}
+        file_path = config["watermarked_file"]
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=500, detail=f"Encoded file not found: {file_path}")
+        return FileResponse(file_path, media_type="audio/wav", filename=os.path.basename(file_path))
+
+    return {"success": True, "config": config}
 
 
 @app.post("/corrupt")
-def corrupt(payload: Dict[str, Any] = Body(None)) -> Any:
-    payload = payload or {}
+def corrupt(payload: Dict[str, Any] = {}) -> Any:
     config = merge_request_config(payload)
     success = corrupt_audio(
         input_file=config["watermarked_file"],
@@ -132,14 +134,18 @@ def corrupt(payload: Dict[str, Any] = Body(None)) -> Any:
     )
     if not success:
         raise HTTPException(status_code=500, detail="Corruption failed")
+
     if payload.get("return_file", False):
-        return FileResponse(config["corrupted_file"], media_type="audio/wav", filename=os.path.basename(config["corrupted_file"]))
-    return {"success": True, "config": config, "file": config["corrupted_file"]}
+        file_path = config["corrupted_file"]
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=500, detail=f"Corrupted file not found: {file_path}")
+        return FileResponse(file_path, media_type="audio/wav", filename=os.path.basename(file_path))
+
+    return {"success": True, "config": config}
 
 
 @app.post("/decode")
-def decode(payload: Dict[str, Any] = Body(None)) -> Dict[str, Any]:
-    payload = payload or {}
+def decode(payload: Dict[str, Any] = {}) -> Dict[str, Any]:
     config = merge_request_config(payload)
     target_file = payload.get("target_file", config["corrupted_file"])
     result = test_watermark(target_file, config["secret_file"], config["algorithm"])
@@ -149,50 +155,12 @@ def decode(payload: Dict[str, Any] = Body(None)) -> Dict[str, Any]:
 
 
 @app.post("/decode_original")
-def decode_original(payload: Dict[str, Any] = Body(None)) -> Dict[str, Any]:
-    payload = payload or {}
+def decode_original(payload: Dict[str, Any] = {}) -> Dict[str, Any]:
     config = merge_request_config(payload)
     result = test_watermark(config["watermarked_file"], config["secret_file"], config["algorithm"])
     if result is None:
         raise HTTPException(status_code=500, detail="Decode original failed")
     return {"success": True, "result": result}
-
-
-@app.post("/pipeline")
-def pipeline(payload: Dict[str, Any] = Body(None)) -> Any:
-    payload = payload or {}
-    config = merge_request_config(payload)
-    if not encode_audio(
-        config["input_file"],
-        config["watermarked_file"],
-        config["secret_file"],
-        config["algorithm"],
-    ):
-        raise HTTPException(status_code=500, detail="Encode stage failed")
-    if not corrupt_audio(
-        input_file=config["watermarked_file"],
-        output_file=config["corrupted_file"],
-        attack_mp3=config["attack_mp3"],
-        mp3_bitrate=config["mp3_bitrate"],
-        attack_cut=config["attack_cut"],
-        cut_duration=config["cut_duration"],
-        attack_speed=config["attack_speed"],
-        speed_factor=config["speed_factor"],
-        attack_noise=config["attack_noise"],
-        noise_level=config["noise_level"],
-        attack_lpf=config["attack_lpf"],
-        lpf_cutoff=config["lpf_cutoff"],
-        attack_volume=config["attack_volume"],
-        volume_factor=config["volume_factor"],
-        simulate_platform=config["simulate_platform"],
-    ):
-        raise HTTPException(status_code=500, detail="Corrupt stage failed")
-    result = test_watermark(config["corrupted_file"], config["secret_file"], config["algorithm"])
-    if result is None:
-        raise HTTPException(status_code=500, detail="Decode stage failed")
-    if payload.get("return_file", False):
-        return FileResponse(config["corrupted_file"], media_type="audio/wav", filename=os.path.basename(config["corrupted_file"]))
-    return {"success": True, "stage": "pipeline", "result": result, "file": config["corrupted_file"]}
 
 if __name__ == "__main__":
     import uvicorn
