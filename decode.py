@@ -1,17 +1,17 @@
-import os
+﻿import os
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
-import time
 import torch
 import torchaudio
 from torchaudio.functional import resample
 import numpy as np
 
+
 def test_watermark(target_file="corrupted.wav", secret_file="secret.npy", algorithm="wavmark"):
     print(f"\n--- DECODING & TESTING WITH {algorithm.upper()} ---")
     if not os.path.exists(target_file) or not os.path.exists(secret_file):
         print("[!] Error: Missing target or secret file.")
-        return
+        return None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hardware Engine: {device.type.upper()}")
@@ -26,9 +26,11 @@ def test_watermark(target_file="corrupted.wav", secret_file="secret.npy", algori
     else:
         wav_16k_mono = wav_16k
 
-    # ==========================================
-    # ALGORITHM: AUDIOSEAL
-    # ==========================================
+    result = {
+        "algorithm": algorithm,
+        "original_secret": original_secret.tolist(),
+    }
+
     if algorithm == "audioseal":
         from audioseal import AudioSeal
         print("Loading AudioSeal Detector...")
@@ -38,20 +40,21 @@ def test_watermark(target_file="corrupted.wav", secret_file="secret.npy", algori
         
         print("Scanning audio...")
         with torch.no_grad():
-            result, decoded_message = detector(wav_16k_mono)
+            result_tensor, decoded_message = detector(wav_16k_mono)
 
-        probability = result[:, 1, :].mean().item()
-        is_watermarked = probability > 0.5
-        
-        # Convert logits to binary array
+        probability = result_tensor[:, 1, :].mean().item()
         decoded_binary = (decoded_message > 0.5).int().cpu().numpy()[0]
         accuracy = (decoded_binary == original_secret).mean() * 100
-        
+        is_watermarked = probability > 0.5
         confidence_str = f"{probability:.1%}"
 
-    # ==========================================
-    # ALGORITHM: WAVMARK
-    # ==========================================
+        result.update({
+            "decoded_secret": decoded_binary.tolist(),
+            "accuracy": float(accuracy),
+            "is_watermarked": bool(is_watermarked),
+            "confidence": confidence_str,
+        })
+
     elif algorithm == "wavmark":
         import wavmark
         print("Loading WavMark Detector...")
@@ -60,27 +63,32 @@ def test_watermark(target_file="corrupted.wav", secret_file="secret.npy", algori
 
         print("Scanning audio...")
         decoded_binary, _ = wavmark.decode_watermark(model, audio_np, show_progress=True)
-        
         accuracy = (original_secret == decoded_binary).mean() * 100
+        ber = float((original_secret != decoded_binary).mean())
         is_watermarked = accuracy >= 85.0
-        ber = (original_secret != decoded_binary).mean()
-        confidence_str = f"N/A (WavMark uses BER: {ber:.3f})"
 
+        result.update({
+            "decoded_secret": decoded_binary.tolist(),
+            "accuracy": float(accuracy),
+            "bit_error_rate": float(ber),
+            "is_watermarked": bool(is_watermarked),
+            "confidence": "N/A",
+        })
     else:
         print("[!] Unknown algorithm selected.")
-        return
+        return None
 
-    print("\n" + "="*45)
-    print("                 RESULTS")
-    print("="*45)
-    print(f"Algorithm:    {algorithm.upper()}")
-    print(f"Original ID:  {original_secret.tolist()}")
-    print(f"Recovered ID: {decoded_binary.tolist()}")
-    print("-" * 45)
-    print(f"Payload Accuracy: {accuracy:.1f}%")
-    print(f"Watermark Found:  {is_watermarked} (Confidence: {confidence_str})")
-    print("="*45 + "\n")
-    time.sleep(1)
+    print("\n===== RESULTS =====")
+    print(f"Algorithm: {algorithm.upper()}")
+    print(f"Original ID: {original_secret.tolist()}")
+    print(f"Recovered ID: {result['decoded_secret']}")
+    print(f"Payload Accuracy: {result['accuracy']:.1f}%")
+    print(f"Watermark Found: {result['is_watermarked']} (Confidence: {result['confidence']})")
+    print("===================\n")
+
+    return result
+
 
 if __name__ == "__main__":
-    test_watermark()
+    result = test_watermark()
+    print(result)
