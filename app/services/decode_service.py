@@ -1,5 +1,4 @@
-﻿import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
+import os
 
 import torch
 import torchaudio
@@ -15,7 +14,7 @@ def test_watermark(target_file="corrupted.wav", secret_file="secret.npy", algori
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hardware Engine: {device.type.upper()}")
-    
+
     original_secret = np.load(secret_file)
 
     print(f"Loading '{target_file}'...")
@@ -35,9 +34,9 @@ def test_watermark(target_file="corrupted.wav", secret_file="secret.npy", algori
         from audioseal import AudioSeal
         print("Loading AudioSeal Detector...")
         detector = AudioSeal.load_detector("audioseal_detector_16bits").to(device)
-        
+
         wav_16k_mono = wav_16k_mono.unsqueeze(0).to(device)
-        
+
         print("Scanning audio...")
         with torch.no_grad():
             result_tensor, decoded_message = detector(wav_16k_mono)
