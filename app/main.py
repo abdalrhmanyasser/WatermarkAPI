@@ -1,114 +1,36 @@
+import asyncio
+import json
 import os
+import shutil
+import uuid
+import numpy as np
+from typing import Any, Dict, Literal
+
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from typing import Any, Dict, Optional
+from sqlalchemy.orm import Session
 
-from app.models.schemas import (
-    ConfigRequest,
-    CorruptRequest,
-    DecodeOriginalRequest,
-    DecodeRequest,
-    EncodeRequest,
-)
 from app.services.corrupt_service import corrupt_audio
 from app.services.decode_service import test_watermark
 from app.services.encode_service import encode_audio
-from app.services.user_service import append_user_secret, ensure_data_root
+from auth import get_current_user
+from database import get_db, init_db
+from models import User, WatermarkSecret
 
-# Loads the variables from the .env file into your environment
+
 load_dotenv()
-
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
+# os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["HF_TOKEN"] = os.getenv("API_KEY")
 if not os.getenv("API_KEY"):
-    raise ValueError("API_KEY is missing from the environment!")
+    print("HuggingFace API_KEY is missing from the environment!")
 
-print("Token loaded successfully!")
+# Initialize Database on Startup
+init_db()
 
-CONFIG: Dict[str, Any] = {
-    "input_file": "input.wav",
-    "watermarked_file": "watermarked.wav",
-    "corrupted_file": "corrupted.wav",
-    "secret_file": "secret.npy",
-    "algorithm": "wavmark",
-    "attack_mp3": False,
-    "mp3_bitrate": 128.0,
-    "attack_cut": False,
-    "cut_duration": 4.0,
-    "attack_speed": False,
-    "speed_factor": 1.15,
-    "attack_noise": False,
-    "noise_level": 0.02,
-    "attack_lpf": False,
-    "lpf_cutoff": 4000.0,
-    "attack_volume": False,
-    "volume_factor": 0.5,
-    "simulate_platform": "none",
-}
-
-VALID_CONFIG_KEYS = set(CONFIG.keys())
-STORAGE_ROOT = os.path.join(os.getcwd(), "user_data")
-
-
-def get_user_storage(user_id: Optional[str]) -> str:
-    if not user_id:
-        return STORAGE_ROOT
-    return os.path.join(STORAGE_ROOT, user_id)
-
-
-def ensure_user_storage(user_id: Optional[str]) -> str:
-    root = get_user_storage(user_id)
-    os.makedirs(root, exist_ok=True)
-    return root
-
-
-def resolve_user_path(path: Optional[str], user_id: Optional[str]) -> Optional[str]:
-    if not path or not user_id:
-        return path
-    if os.path.isabs(path):
-        return path
-    return os.path.join(get_user_storage(user_id), path)
-
-
-def apply_user_paths(config: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
-    if not user_id:
-        return config
-
-    ensure_user_storage(user_id)
-    updated = config.copy()
-    for key in ["input_file", "watermarked_file", "corrupted_file", "secret_file"]:
-        if key not in updated:
-            continue
-        value = updated[key]
-        if not value:
-            continue
-        if os.path.isabs(value):
-            continue
-        updated[key] = os.path.join(get_user_storage(user_id), value)
-    return updated
-
-
-def merge_request_config(payload: Dict[str, Any]) -> Dict[str, Any]:
-    merged = CONFIG.copy()
-    for key, value in payload.items():
-        if key in VALID_CONFIG_KEYS:
-            merged[key] = value
-    return merged
-
-
-def validate_config(payload: Dict[str, Any]) -> None:
-    unknown_keys = [k for k in payload.keys() if k not in VALID_CONFIG_KEYS]
-    if unknown_keys:
-        raise ValueError(f"Unknown config keys: {unknown_keys}")
-    if "algorithm" in payload and payload["algorithm"] not in {"wavmark", "audioseal"}:
-        raise ValueError("algorithm must be 'wavmark' or 'audioseal'")
-    if "simulate_platform" in payload and payload["simulate_platform"] not in {"none", "youtube", "instagram", "whatsapp"}:
-        raise ValueError("simulate_platform must be one of 'none', 'youtube', 'instagram', 'whatsapp'")
-
-
-app = FastAPI(title="Audio Watermark API")
+app = FastAPI(title="Stateless Audio Watermark API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -117,167 +39,239 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global Lock to prevent GPU Out-of-Memory crashes
+gpu_lock = asyncio.Lock()
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB limit
+ALLOWED_AUDIO_TYPES = ["audio/wav", "audio/x-wav", "audio/vnd.wave", "audio/mpeg", "audio/mp3"]
+ALLOWED_EXTENSIONS = (".wav", ".mp3")
+
+
+def cleanup_temp_dir(dir_path: str):
+    """Deletes temporary files after the HTTP response is sent."""
+    if os.path.exists(dir_path):
+        shutil.rmtree(dir_path, ignore_errors=True)
+        print(f"Cleaned up temporary workspace: {dir_path}")
+
+
+async def validate_and_save_upload(upload_file: UploadFile, dest_path: str):
+    """Validates the file type and size, then saves it to disk."""
+    # Check both the MIME type and the file extension
+    is_valid_mime = upload_file.content_type in ALLOWED_AUDIO_TYPES
+    is_valid_ext = upload_file.filename.lower().endswith(ALLOWED_EXTENSIONS)
+    
+    if not (is_valid_mime or is_valid_ext):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid file type. Client sent: '{upload_file.content_type}'. Only WAV/MP3 allowed."
+        )
+    
+    file_bytes = await upload_file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 50MB.")
+        
+    with open(dest_path, "wb") as f:
+        f.write(file_bytes)
+
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
-
-@app.get("/config")
-def get_config() -> Dict[str, Any]:
-    return {"config": CONFIG}
-
-
-@app.post(
-    "/config",
-    summary="Update runtime watermarking settings",
-    description="Update the active pipeline configuration. Only supplied values are changed.",
-)
-def set_config(payload: ConfigRequest = Body(default=ConfigRequest())) -> Dict[str, Any]:
-    values = payload.dict(exclude_none=True)
-    try:
-        validate_config(values)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    CONFIG.update({k: v for k, v in values.items() if k in VALID_CONFIG_KEYS})
-    return {"updated_config": CONFIG}
-
-
-@app.post(
-    "/encode",
-    summary="Encode a watermark into audio",
-    description="Embed a watermark into an input WAV file and optionally return the generated watermarked audio.",
-)
+@app.post("/encode")
 async def encode(
-    payload: EncodeRequest = Body(default=EncodeRequest()),
-    input_file: Optional[UploadFile] = File(default=None),
+    background_tasks: BackgroundTasks,
+    input_file: UploadFile = File(...),
+    # Added all 6 new algorithms to the type hint:
+    algorithm: Literal["wavmark", "audioseal", "qim", "dwt_svd", "echo", "lsb", "phase", "hybrid"] = Form("wavmark"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> Any:
-    config = merge_request_config(payload.dict(exclude_none=True))
-    config = apply_user_paths(config, payload.user_id)
+    # 1. Setup secure temporary workspace
+    req_id = str(uuid.uuid4())
+    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", req_id)
+    os.makedirs(temp_dir, exist_ok=True)
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
-    if input_file:
-        os.makedirs(os.path.dirname(config["input_file"]), exist_ok=True)
-        with open(config["input_file"], "wb") as opened:
-            opened.write(await input_file.read())
+    in_path = os.path.join(temp_dir, "input.wav")
+    out_path = os.path.join(temp_dir, "watermarked.wav")
+    secret_path = os.path.join(temp_dir, "secret.npy")
 
-    success = encode_audio(
-        config["input_file"],
-        config["watermarked_file"],
-        config["secret_file"],
-        config["algorithm"],
-    )
+    # 2. Validate and process file
+    await validate_and_save_upload(input_file, in_path)
+
+    # 3. Process on GPU securely using Lock and Threadpool
+    async with gpu_lock:
+        success = await run_in_threadpool(
+            encode_audio,
+            input_file=in_path,
+            output_file=out_path,
+            secret_file=secret_path,
+            algorithm=algorithm,
+        )
+        
     if not success:
         raise HTTPException(status_code=500, detail="Encoding failed")
 
-    append_user_secret(payload.user_id or "anonymous", config["secret_file"], "<secret-not-logged>")
+    # 4. Read numpy secret array and save to SQLite
+    payload_np = np.load(secret_path)
+    payload_json = json.dumps(payload_np.tolist())
 
-    if payload.return_file:
-        file_path = config["watermarked_file"]
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=500, detail=f"Encoded file not found: {file_path}")
-        return FileResponse(file_path, media_type="audio/wav", filename=os.path.basename(file_path))
-
-    return {"success": True, "config": config}
-
-
-@app.post(
-    "/corrupt",
-    summary="Corrupt the watermarked audio",
-    description="Apply attack transformations to the watermarked audio and optionally return the corrupted WAV file.",
-)
-async def corrupt(
-    payload: CorruptRequest = Body(default=CorruptRequest()),
-    watermarked_file: Optional[UploadFile] = File(default=None),
-) -> Any:
-    config = merge_request_config(payload.dict(exclude_none=True))
-    config = apply_user_paths(config, payload.user_id)
-
-    if watermarked_file:
-        os.makedirs(os.path.dirname(config["watermarked_file"]), exist_ok=True)
-        with open(config["watermarked_file"], "wb") as opened:
-            opened.write(await watermarked_file.read())
-
-    success = corrupt_audio(
-        input_file=config["watermarked_file"],
-        output_file=config["corrupted_file"],
-        attack_mp3=config["attack_mp3"],
-        mp3_bitrate=config["mp3_bitrate"],
-        attack_cut=config["attack_cut"],
-        cut_duration=config["cut_duration"],
-        attack_speed=config["attack_speed"],
-        speed_factor=config["speed_factor"],
-        attack_noise=config["attack_noise"],
-        noise_level=config["noise_level"],
-        attack_lpf=config["attack_lpf"],
-        lpf_cutoff=config["lpf_cutoff"],
-        attack_volume=config["attack_volume"],
-        volume_factor=config["volume_factor"],
-        simulate_platform=config["simulate_platform"],
+    secret_record = WatermarkSecret(
+        user_id=current_user.id,
+        algorithm=algorithm,
+        payload=payload_json,
     )
+    db.add(secret_record)
+    db.commit()
+    db.refresh(secret_record)
+
+    # 5. Return the processed file directly, attaching the Secret ID to the headers
+    return FileResponse(
+        out_path, 
+        media_type="audio/wav", 
+        filename=f"watermarked_{secret_record.id}.wav",
+        headers={"X-Secret-ID": str(secret_record.id)}
+    )
+
+@app.post("/corrupt")
+async def corrupt(
+    background_tasks: BackgroundTasks,
+    watermarked_file: UploadFile = File(...),
+    attack_mp3: bool = Form(False),
+    mp3_bitrate: float = Form(128.0),
+    attack_cut: bool = Form(False),
+    cut_duration: float = Form(4.0),
+    attack_speed: bool = Form(False),
+    speed_factor: float = Form(1.15),
+    attack_noise: bool = Form(False),
+    noise_level: float = Form(0.02),
+    attack_lpf: bool = Form(False),
+    lpf_cutoff: float = Form(4000.0),
+    attack_volume: bool = Form(False),
+    volume_factor: float = Form(0.5),
+    # --- NEW FORM FIELDS ADDED ---
+    attack_hpf: bool = Form(False),
+    hpf_cutoff: float = Form(500.0),
+    attack_clipping: bool = Form(False),
+    clip_threshold: float = Form(0.5),
+    attack_resample: bool = Form(False),
+    downsample_sr: int = Form(8000),
+    attack_echo: bool = Form(False),
+    echo_delay_ms: int = Form(200),
+    echo_decay: float = Form(0.5),
+    attack_pitch: bool = Form(False),
+    pitch_steps: int = Form(2),
+    simulate_platform: Literal["none", "youtube", "instagram", "whatsapp", "tiktok"] = Form("none"),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    # 1. Setup secure temporary workspace
+    req_id = str(uuid.uuid4())
+    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", req_id)
+    os.makedirs(temp_dir, exist_ok=True)
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+    in_path = os.path.join(temp_dir, "watermarked.wav")
+    out_path = os.path.join(temp_dir, "corrupted.wav")
+
+    # 2. Validate and process file
+    await validate_and_save_upload(watermarked_file, in_path)
+
+    # 3. Process on GPU securely using Lock and Threadpool
+    async with gpu_lock:
+        success = await run_in_threadpool(
+            corrupt_audio,
+            input_file=in_path,
+            output_file=out_path,
+            attack_mp3=attack_mp3,
+            mp3_bitrate=mp3_bitrate,
+            attack_cut=attack_cut,
+            cut_duration=cut_duration,
+            attack_speed=attack_speed,
+            speed_factor=speed_factor,
+            attack_noise=attack_noise,
+            noise_level=noise_level,
+            attack_lpf=attack_lpf,
+            lpf_cutoff=lpf_cutoff,
+            attack_volume=attack_volume,
+            volume_factor=volume_factor,
+            attack_hpf=attack_hpf,
+            hpf_cutoff=hpf_cutoff,
+            attack_clipping=attack_clipping,
+            clip_threshold=clip_threshold,
+            attack_resample=attack_resample,
+            downsample_sr=downsample_sr,
+            attack_echo=attack_echo,
+            echo_delay_ms=echo_delay_ms,
+            echo_decay=echo_decay,
+            attack_pitch=attack_pitch,
+            pitch_steps=pitch_steps,
+            simulate_platform=simulate_platform,
+        )
+        
     if not success:
         raise HTTPException(status_code=500, detail="Corruption failed")
 
-    if payload.return_file:
-        file_path = config["corrupted_file"]
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=500, detail=f"Corrupted file not found: {file_path}")
-        return FileResponse(file_path, media_type="audio/wav", filename=os.path.basename(file_path))
-
-    return {"success": True, "config": config}
+    return FileResponse(out_path, media_type="audio/wav", filename="corrupted.wav")
 
 
-@app.post(
-    "/decode",
-    summary="Decode a watermark from a corrupted file",
-    description="Decode the watermark from the specified target file, defaulting to the current corrupted file.",
-)
+@app.post("/decode")
 async def decode(
-    payload: DecodeRequest = Body(default=DecodeRequest()),
-    corrupted_file: Optional[UploadFile] = File(default=None),
+    background_tasks: BackgroundTasks,
+    secret_id: int = Form(...),
+    corrupted_file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    config = merge_request_config(payload.dict(exclude_none=True))
-    config = apply_user_paths(config, payload.user_id)
+    
+    # 1. Verify user owns this secret
+    secret_record = db.query(WatermarkSecret).filter(
+        WatermarkSecret.id == secret_id,
+        WatermarkSecret.user_id == current_user.id
+    ).first()
+    
+    if not secret_record:
+        raise HTTPException(status_code=404, detail="Secret ID not found or access denied.")
 
-    if corrupted_file:
-        os.makedirs(os.path.dirname(config["corrupted_file"]), exist_ok=True)
-        with open(config["corrupted_file"], "wb") as opened:
-            opened.write(await corrupted_file.read())
-        target_file = config["corrupted_file"]
-    else:
-        target_file = payload.target_file or config["corrupted_file"]
-        target_file = resolve_user_path(target_file, payload.user_id)
+    # 2. Setup secure temporary workspace
+    req_id = str(uuid.uuid4())
+    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", req_id)
+    os.makedirs(temp_dir, exist_ok=True)
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
-    result = test_watermark(target_file, config["secret_file"], config["algorithm"])
+    target_path = os.path.join(temp_dir, "target.wav")
+    secret_path = os.path.join(temp_dir, "secret.npy")
+
+    # 3. Rebuild secret.npy from the Database JSON
+    payload_list = json.loads(secret_record.payload)
+    payload_np = np.array(payload_list, dtype=np.int32)
+    np.save(secret_path, payload_np)
+
+    # 4. Validate and process file
+    await validate_and_save_upload(corrupted_file, target_path)
+
+    # 5. Process on GPU securely using Lock and Threadpool
+    async with gpu_lock:
+        result = await run_in_threadpool(
+            test_watermark, 
+            target_path, 
+            secret_path, 
+            secret_record.algorithm
+        )
+        
     if result is None:
         raise HTTPException(status_code=500, detail="Decode failed")
-    return {"success": True, "result": result}
-
-
-@app.post(
-    "/decode_original",
-    summary="Decode the watermark from the original watermarked file",
-    description="Decode the watermark from the most recently created watermarked audio file.",
-)
-async def decode_original(
-    payload: DecodeOriginalRequest = Body(default=DecodeOriginalRequest()),
-    watermarked_file: Optional[UploadFile] = File(default=None),
-) -> Dict[str, Any]:
-    config = merge_request_config(payload.dict(exclude_none=True))
-    config = apply_user_paths(config, payload.user_id)
-
-    if watermarked_file:
-        os.makedirs(os.path.dirname(config["watermarked_file"]), exist_ok=True)
-        with open(config["watermarked_file"], "wb") as opened:
-            opened.write(await watermarked_file.read())
-
-    result = test_watermark(config["watermarked_file"], config["secret_file"], config["algorithm"])
-    if result is None:
-        raise HTTPException(status_code=500, detail="Decode original failed")
+        
     return {"success": True, "result": result}
 
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Tell Uvicorn to ignore the temp folder when looking for code changes
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=True,
+        reload_excludes=["temp_workspaces/*", "*.wav", "*.npy"]
+    )
