@@ -1,4 +1,4 @@
-# WatermarkPro API Reference
+# Watermark API Reference
 
 Welcome to the WatermarkPro API documentation. This API provides asynchronous, GPU-accelerated endpoints for embedding and extracting cryptographic watermarks in audio files.
 
