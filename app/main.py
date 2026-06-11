@@ -2,9 +2,11 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import uuid
 import numpy as np
 from typing import Any, Dict, Literal
+import torch
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -16,8 +18,9 @@ from sqlalchemy.orm import Session
 from app.services.corrupt_service import corrupt_audio
 from app.services.decode_service import test_watermark
 from app.services.encode_service import encode_audio
+from app.services.progress_manager import progress_tracker
 from auth import get_current_user
-from database import get_db, init_db
+from database import get_db, init_db, SessionLocal
 from models import User, WatermarkSecret
 
 
@@ -54,6 +57,28 @@ def cleanup_temp_dir(dir_path: str):
         print(f"Cleaned up temporary workspace: {dir_path}")
 
 
+def convert_to_wav(input_path: str, output_path: str) -> bool:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "pcm_s16le",
+        output_path,
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+        err = res.stderr.decode('utf-8', errors='replace')
+        print(f"[decode] ffmpeg conversion failed: {err}")
+        return False
+    return True
+
+
 async def validate_and_save_upload(upload_file: UploadFile, dest_path: str):
     """Validates the file type and size, then saves it to disk."""
     # Check both the MIME type and the file extension
@@ -78,61 +103,24 @@ async def validate_and_save_upload(upload_file: UploadFile, dest_path: str):
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
-@app.post("/encode")
-async def encode(
-    background_tasks: BackgroundTasks,
-    input_file: UploadFile = File(...),
-    # Added all 6 new algorithms to the type hint:
-    algorithm: Literal["wavmark", "audioseal", "qim", "dwt_svd", "echo", "lsb", "phase", "hybrid"] = Form("wavmark"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Any:
-    # 1. Setup secure temporary workspace
-    req_id = str(uuid.uuid4())
-    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", req_id)
-    os.makedirs(temp_dir, exist_ok=True)
-    background_tasks.add_task(cleanup_temp_dir, temp_dir)
-
-    in_path = os.path.join(temp_dir, "input.wav")
-    out_path = os.path.join(temp_dir, "watermarked.wav")
-    secret_path = os.path.join(temp_dir, "secret.npy")
-
-    # 2. Validate and process file
-    await validate_and_save_upload(input_file, in_path)
-
-    # 3. Process on GPU securely using Lock and Threadpool
-    async with gpu_lock:
-        success = await run_in_threadpool(
-            encode_audio,
-            input_file=in_path,
-            output_file=out_path,
-            secret_file=secret_path,
-            algorithm=algorithm,
-        )
+def run_decode_worker(task_id: str, temp_dir: str, target_path: str, secret_path: str, algorithm: str):
+    try:
+        # The lock protects the GPU from Out Of Memory errors during background tasks
+        with torch.no_grad(): 
+            result = test_watermark(target_path, secret_path, algorithm, task_id=task_id)
         
-    if not success:
-        raise HTTPException(status_code=500, detail="Encoding failed")
+        if result:
+            progress_tracker.complete_task(task_id, result)
+        else:
+            progress_tracker.update_progress(task_id, -1, "Decode failed internally.")
+    except Exception as e:
+        progress_tracker.update_progress(task_id, -1, f"Crash: {str(e)}")
+    finally:
+        # Guarantee cleanup only happens AFTER the decoding is fully complete or crashes
+        cleanup_temp_dir(temp_dir)
 
-    # 4. Read numpy secret array and save to SQLite
-    payload_np = np.load(secret_path)
-    payload_json = json.dumps(payload_np.tolist())
-
-    secret_record = WatermarkSecret(
-        user_id=current_user.id,
-        algorithm=algorithm,
-        payload=payload_json,
-    )
-    db.add(secret_record)
-    db.commit()
-    db.refresh(secret_record)
-
-    # 5. Return the processed file directly, attaching the Secret ID to the headers
-    return FileResponse(
-        out_path, 
-        media_type="audio/wav", 
-        filename=f"watermarked_{secret_record.id}.wav",
-        headers={"X-Secret-ID": str(secret_record.id)}
-    )
+# NOTE: Duplicate /decode endpoint removed. The active decode endpoint
+# lives further down in this file (it includes proper cleanup).
 
 @app.post("/corrupt")
 async def corrupt(
@@ -214,16 +202,126 @@ async def corrupt(
 
     return FileResponse(out_path, media_type="audio/wav", filename="corrupted.wav")
 
+def run_encode_worker(task_id: str, temp_dir: str, in_path: str, out_path: str, secret_path: str, algorithm: str, user_id: int):
+    success = False
+    try:
+        with torch.no_grad():
+            success = encode_audio(
+                input_file=in_path,
+                output_file=out_path,
+                secret_file=secret_path,
+                algorithm=algorithm,
+                task_id=task_id
+            )
+            
+        if success:
+            progress_tracker.update_progress(task_id, 90, "Saving cryptographic secret to database...")
+            db = SessionLocal()
+            try:
+                payload_np = np.load(secret_path)
+                payload_json = json.dumps(payload_np.tolist())
+                
+                secret_record = WatermarkSecret(
+                    user_id=user_id,
+                    algorithm=algorithm,
+                    payload=payload_json,
+                )
+                db.add(secret_record)
+                db.commit()
+                db.refresh(secret_record)
+                
+                progress_tracker.complete_task(task_id, {"secret_id": secret_record.id})
+                
+            finally:
+                db.close()
+        else:
+            progress_tracker.update_progress(task_id, -1, "Encoding failed internally.")
+            # If the process fails organically, we clean up the failed files.
+            cleanup_temp_dir(temp_dir)
+            
+    except Exception as e:
+        progress_tracker.update_progress(task_id, -1, f"Crash: {str(e)}")
+        # If the process crashes violently, we also clean up.
+        cleanup_temp_dir(temp_dir)
 
+
+@app.post("/encode")
+async def start_encode(
+    background_tasks: BackgroundTasks,
+    input_file: UploadFile = File(...),
+    algorithm: Literal["wavmark", "audioseal", "qim", "dwt_svd", "echo", "lsb", "phase", "hybrid"] = Form("wavmark"),
+    current_user: User = Depends(get_current_user),
+):
+    task_id = str(uuid.uuid4())
+    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", task_id)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    in_path = os.path.join(temp_dir, "input.wav")
+    out_path = os.path.join(temp_dir, "watermarked.wav")
+    secret_path = os.path.join(temp_dir, "secret.npy")
+
+    await validate_and_save_upload(input_file, in_path)
+
+    progress_tracker.update_progress(task_id, 0, "Audio queued for encoding...")
+    
+    # We pass the temp_dir so the worker can manage its own lifecycle based on success or failure
+    background_tasks.add_task(
+        run_encode_worker,
+        task_id=task_id,
+        temp_dir=temp_dir,
+        in_path=in_path,
+        out_path=out_path,
+        secret_path=secret_path,
+        algorithm=algorithm,
+        user_id=current_user.id
+    )
+    
+    return {"task_id": task_id}
+
+@app.get("/encode/progress/{task_id}")
+def check_encode_progress(task_id: str):
+    task_state = progress_tracker.get_status(task_id)
+    
+    if task_state["status"] == "Not Found":
+        raise HTTPException(status_code=404, detail="Task not found or expired.")
+        
+    if task_state["progress"] == -1:
+        raise HTTPException(status_code=500, detail=task_state["status"])
+        
+    return task_state
+
+@app.get("/encode/download/{task_id}")
+def download_encoded(task_id: str, background_tasks: BackgroundTasks):
+    task_state = progress_tracker.get_status(task_id)
+    
+    if task_state["status"] != "Completed":
+        raise HTTPException(status_code=400, detail="Task not ready or failed.")
+        
+    secret_id = task_state["result"]["secret_id"]
+    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", task_id)
+    out_path = os.path.join(temp_dir, "watermarked.wav")
+    
+    if not os.path.exists(out_path):
+        raise HTTPException(status_code=404, detail="File lost or expired.")
+        
+    # FastAPI's background_tasks in a GET request execute strictly AFTER the HTTP response finishes sending.
+    # This securely deletes the temp folder immediately after the Android app successfully finishes downloading the WAV.
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
+    
+    return FileResponse(
+        out_path, 
+        media_type="audio/wav", 
+        filename=f"watermarked_{secret_id}.wav",
+        headers={"X-Secret-ID": str(secret_id)}
+    )
 @app.post("/decode")
-async def decode(
+async def start_decode(
     background_tasks: BackgroundTasks,
     secret_id: int = Form(...),
     corrupted_file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    
+):
     # 1. Verify user owns this secret
     secret_record = db.query(WatermarkSecret).filter(
         WatermarkSecret.id == secret_id,
@@ -233,36 +331,54 @@ async def decode(
     if not secret_record:
         raise HTTPException(status_code=404, detail="Secret ID not found or access denied.")
 
-    # 2. Setup secure temporary workspace
-    req_id = str(uuid.uuid4())
-    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", req_id)
+    # 2. Setup secure workspace and ID
+    task_id = str(uuid.uuid4())
+    temp_dir = os.path.join(os.getcwd(), "temp_workspaces", task_id)
     os.makedirs(temp_dir, exist_ok=True)
-    background_tasks.add_task(cleanup_temp_dir, temp_dir)
 
+    raw_target_path = os.path.join(temp_dir, "target.raw")
     target_path = os.path.join(temp_dir, "target.wav")
     secret_path = os.path.join(temp_dir, "secret.npy")
 
-    # 3. Rebuild secret.npy from the Database JSON
+    # 3. Rebuild secret.npy
     payload_list = json.loads(secret_record.payload)
     payload_np = np.array(payload_list, dtype=np.int32)
     np.save(secret_path, payload_np)
 
-    # 4. Validate and process file
-    await validate_and_save_upload(corrupted_file, target_path)
+    # 4. Save upload and normalize to WAV
+    await validate_and_save_upload(corrupted_file, raw_target_path)
+    if not convert_to_wav(raw_target_path, target_path):
+        raise HTTPException(status_code=500, detail="Could not convert uploaded audio to WAV for decoding.")
+    if os.path.exists(raw_target_path):
+        os.remove(raw_target_path)
 
-    # 5. Process on GPU securely using Lock and Threadpool
-    async with gpu_lock:
-        result = await run_in_threadpool(
-            test_watermark, 
-            target_path, 
-            secret_path, 
-            secret_record.algorithm
-        )
+    # 5. Initialize tracking and start background GPU task
+    progress_tracker.update_progress(task_id, 0, "Audio queued for processing...")
+    
+    background_tasks.add_task(
+        run_decode_worker, 
+        task_id=task_id, 
+        temp_dir=temp_dir,
+        target_path=target_path, 
+        secret_path=secret_path, 
+        algorithm=secret_record.algorithm
+    )
+    
+    # 6. Instantly return task_id to Android app
+    return {"task_id": task_id}
+
+# --- ADD THIS NEW ENDPOINT ---
+@app.get("/decode/progress/{task_id}")
+def check_decode_progress(task_id: str):
+    task_state = progress_tracker.get_status(task_id)
+    
+    if task_state["status"] == "Not Found":
+        raise HTTPException(status_code=404, detail="Task not found or expired.")
         
-    if result is None:
-        raise HTTPException(status_code=500, detail="Decode failed")
+    if task_state["progress"] == -1:
+        raise HTTPException(status_code=500, detail=task_state["status"])
         
-    return {"success": True, "result": result}
+    return task_state
 
 
 if __name__ == "__main__":
