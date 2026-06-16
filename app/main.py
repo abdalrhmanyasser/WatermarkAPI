@@ -9,7 +9,7 @@ from typing import Any, Dict, Literal
 import torch
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, status, Body, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -19,9 +19,11 @@ from app.services.corrupt_service import corrupt_audio
 from app.services.decode_service import test_watermark
 from app.services.encode_service import encode_audio
 from app.services.progress_manager import progress_tracker
-from auth import get_current_user
+from auth import get_current_user_from_jwt, verify_api_key, create_access_token, get_password_hash, verify_password
 from database import get_db, init_db, SessionLocal
-from models import User, WatermarkSecret
+from models import User, WatermarkSecret, ApiKey
+from sqlalchemy.orm import Session
+import secrets
 
 
 load_dotenv()
@@ -103,6 +105,95 @@ async def validate_and_save_upload(upload_file: UploadFile, dest_path: str):
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
+
+@app.post("/register", status_code=201)
+def register(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Create a new user account. Body: {"email":..., "password":...}"""
+    email = payload.get("email")
+    password = payload.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    hashed = get_password_hash(password)
+    user = User(email=email, hashed_password=hashed)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"id": user.id, "email": user.email, "message": "User created."}
+
+
+@app.post("/token")
+def token(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Exchange email/password for a JWT. Body: {"email":..., "password":...}"""
+    email = payload.get("email")
+    password = payload.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "expires_in": 3600}
+
+
+@app.post("/keys", status_code=201)
+def create_api_key(body: dict = Body(None), current_user: User = Depends(get_current_user_from_jwt), db: Session = Depends(get_db)):
+    """Create a new API key for machine access. Requires JWT in Authorization header."""
+    name = None
+    scopes = None
+    if body:
+        name = body.get("name")
+        scopes = body.get("scopes")
+    # Key format: <prefix>.<secret>
+    prefix = f"ogs_{secrets.token_hex(6)}"
+    secret = secrets.token_urlsafe(32)
+    raw = f"{prefix}.{secret}"
+    hashed = get_password_hash(secret)
+    scopes_json = json.dumps(scopes) if scopes else None
+    key = ApiKey(user_id=current_user.id, key_prefix=prefix, hashed_secret=hashed, name=name, scopes=scopes_json)
+    db.add(key)
+    db.commit()
+    db.refresh(key)
+    return {"api_key": raw, "key_id": key.id, "message": "Store this raw API key securely — it will not be shown again."}
+
+
+@app.get("/keys")
+def list_api_keys(current_user: User = Depends(get_current_user_from_jwt), db: Session = Depends(get_db)):
+    """List API keys belonging to the authenticated user (JWT required).
+
+    Response JSON array of objects:
+    [ {"key_id": int, "key_prefix": str, "name": str|null, "scopes": list|null, "created_at": iso, "last_used": iso|null } ]
+    """
+    keys = db.query(ApiKey).filter(ApiKey.user_id == current_user.id).all()
+    out = []
+    for k in keys:
+        try:
+            scopes = json.loads(k.scopes) if k.scopes else None
+        except Exception:
+            scopes = None
+        out.append({
+            "key_id": k.id,
+            "key_prefix": k.key_prefix,
+            "name": k.name,
+            "scopes": scopes,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "last_used": k.last_used.isoformat() if k.last_used else None,
+        })
+    return out
+
+
+@app.delete("/keys/{key_id}", status_code=204)
+def revoke_api_key(key_id: int, current_user: User = Depends(get_current_user_from_jwt), db: Session = Depends(get_db)):
+    """Revoke (delete) an API key owned by the authenticated user. Returns 204 No Content on success."""
+    key = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.user_id == current_user.id).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="API key not found")
+    db.delete(key)
+    db.commit()
+    return Response(status_code=204)
+
 def run_decode_worker(task_id: str, temp_dir: str, target_path: str, secret_path: str, algorithm: str):
     try:
         # The lock protects the GPU from Out Of Memory errors during background tasks
@@ -151,7 +242,7 @@ async def corrupt(
     attack_pitch: bool = Form(False),
     pitch_steps: int = Form(2),
     simulate_platform: Literal["none", "youtube", "instagram", "whatsapp", "tiktok"] = Form("none"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_from_jwt),
 ) -> Any:
     # 1. Setup secure temporary workspace
     req_id = str(uuid.uuid4())
@@ -250,7 +341,7 @@ async def start_encode(
     background_tasks: BackgroundTasks,
     input_file: UploadFile = File(...),
     algorithm: Literal["wavmark", "audioseal", "qim", "dwt_svd", "echo", "lsb", "phase", "hybrid"] = Form("wavmark"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(verify_api_key),
 ):
     task_id = str(uuid.uuid4())
     temp_dir = os.path.join(os.getcwd(), "temp_workspaces", task_id)
@@ -279,7 +370,7 @@ async def start_encode(
     return {"task_id": task_id}
 
 @app.get("/encode/progress/{task_id}")
-def check_encode_progress(task_id: str):
+def check_encode_progress(task_id: str, current_user: User = Depends(verify_api_key)):
     task_state = progress_tracker.get_status(task_id)
     
     if task_state["status"] == "Not Found":
@@ -291,7 +382,7 @@ def check_encode_progress(task_id: str):
     return task_state
 
 @app.get("/encode/download/{task_id}")
-def download_encoded(task_id: str, background_tasks: BackgroundTasks):
+def download_encoded(task_id: str, background_tasks: BackgroundTasks, current_user: User = Depends(verify_api_key)):
     task_state = progress_tracker.get_status(task_id)
     
     if task_state["status"] != "Completed":
@@ -319,7 +410,7 @@ async def start_decode(
     background_tasks: BackgroundTasks,
     secret_id: int = Form(...),
     corrupted_file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(verify_api_key),
     db: Session = Depends(get_db),
 ):
     # 1. Verify user owns this secret
@@ -369,7 +460,7 @@ async def start_decode(
 
 # --- ADD THIS NEW ENDPOINT ---
 @app.get("/decode/progress/{task_id}")
-def check_decode_progress(task_id: str):
+def check_decode_progress(task_id: str, current_user: User = Depends(verify_api_key)):
     task_state = progress_tracker.get_status(task_id)
     
     if task_state["status"] == "Not Found":
