@@ -365,7 +365,6 @@ curl.exe -X POST "http://127.0.0.1:8000/decode_original" \
 ├── master.py                    # Entry point, runs FastAPI server
 ├── requirements.txt             # Python dependencies
 ├── .env                         # Environment config (API_KEY required)
-├── input.wav                    # Default input audio file
 ├── README.md                    # This file
 │
 ├── app/
@@ -387,12 +386,6 @@ curl.exe -X POST "http://127.0.0.1:8000/decode_original" \
 │   └── user123/
 │       ├── watermarked.wav
 │       └── ...
-│
-├── encode.py                    # Watermark encoding implementation
-├── corrupt.py                   # Attack pipeline implementation
-├── decode.py                    # Watermark decoding implementation
-├── make_vid.py                  # Video creation utility (optional)
-└── data/                        # Data files directory (optional)
 ```
 
 ## User-Based Data Isolation
