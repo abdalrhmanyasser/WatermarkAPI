@@ -22,36 +22,36 @@ OGSeal is a high-performance, FastAPI-based audio watermarking service providing
 ### Setup
 
 1. **Install dependencies** from `requirements.txt`:
-   $&$bash
+   ```bash
    pip install -r requirements.txt
-   $&$
+   ```
 
 2. **Configure environment variables** in a `.env` file at the project root:
-   $&$env
+   ```env
    API_KEY=your_hugging_face_token_here
    DATABASE_URL=sqlite:///watermarks.db
-   $&$
+   ```
    *Note: `API_KEY` maps to your HuggingFace token, which is essential to fetch and stream core model weights for neural algorithms.*
 
 3. **Initialize an Administrator / User Account:**
    Use the CLI script to create your first human account (which will let you generate API keys later):
-   $&$bash
+   ```bash
    python create_user.py your_email@example.com your_secure_password
-   $&$
+   ```
 
 ---
 
 ## Running the Server
 
 ### Development Mode (With Auto-Reload)
-$&$bash
+```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
-$&$
+```
 
 ### Production Execution
-$&$bash
+```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-$&$
+```
 
 Interactive API documentation will spin up at: `http://127.0.0.1:8000/docs`
 
@@ -123,7 +123,7 @@ Poll this path to extract operational telemetry or complete payloads.
 
 ## Repository Structure
 
-$&$
+```
 .
 ├── main.py                      # API definition, routers, validation hooks
 ├── auth.py                      # Dual JWT and API Key authentication middleware
@@ -140,4 +140,4 @@ $&$
 │       └── progress_manager.py  # Thread-safe thread tracking memory maps
 ├── requirements.txt             # Project dependencies 
 └── .env                         # Local deployment configuration parameters
-$&$
+```
