@@ -229,7 +229,6 @@ async def corrupt(
     lpf_cutoff: float = Form(4000.0),
     attack_volume: bool = Form(False),
     volume_factor: float = Form(0.5),
-    # --- NEW FORM FIELDS ADDED ---
     attack_hpf: bool = Form(False),
     hpf_cutoff: float = Form(500.0),
     attack_clipping: bool = Form(False),
