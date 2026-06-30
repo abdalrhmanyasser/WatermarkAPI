@@ -1,36 +1,32 @@
 import getpass
-import secrets
-from database import SessionLocal, init_db
-from models import User
+from database import get_db
 from auth import get_password_hash
 
+def create_user(full_name: str, email: str, password: str):
+    db = next(get_db())
 
-def create_user(email: str, password: str):
-    init_db()
-    db = SessionLocal()
-
-    existing_user = db.query(User).filter(User.email == email).first()
+    existing_user = db.users.find_one({"email": email})
     if existing_user:
         print(f"User '{email}' already exists.")
-        db.close()
         return
 
-    hashed = get_password_hash(password)
-    new_user = User(email=email, hashed_password=hashed)
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+    user_doc = {
+        "full_name": full_name,
+        "email": email,
+        "hashed_password": get_password_hash(password)
+    }
+    
+    res = db.users.insert_one(user_doc)
 
     print("\n--- USER CREATED SUCCESSFULLY ---")
-    print(f"Email: {new_user.email}")
-    print(f"User ID:  {new_user.id}")
+    print(f"Name:  {full_name}")
+    print(f"Email: {email}")
+    print(f"User ID:  {res.inserted_id}")
     print("---------------------------------\n")
-
-    db.close()
-
 
 if __name__ == "__main__":
     import sys
-    email = sys.argv[1] if len(sys.argv) > 1 else "user@example.com"
-    pwd = sys.argv[2] if len(sys.argv) > 2 else getpass.getpass("Password: ")
-    create_user(email, pwd)
+    full_name = sys.argv[1] if len(sys.argv) > 1 else input("Full Name: ")
+    email = sys.argv[2] if len(sys.argv) > 2 else input("Email: ")
+    pwd = sys.argv[3] if len(sys.argv) > 3 else getpass.getpass("Password: ")
+    create_user(full_name, email, pwd)
